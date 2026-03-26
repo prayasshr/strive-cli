@@ -1,4 +1,4 @@
-# 🚀 Strive CLI (v1.0.0-beta)
+# 🚀 Strive CLI (v1.0.1)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
@@ -11,7 +11,7 @@
 Currently, the Strive CLI suite includes:
 
 ### `strive-sync` (Available Now)
-A visual, parallel Git sync tool for multi-repository environments. It reduces the steps for keeping dozens of repositories in sync to a single command.
+A visual, parallel Git sync tool for multi-repository environments. Auto-detects each repo's default branch, syncs in parallel, and keeps `node_modules` out of the way until you actually need them.
 
 👉 **[Read the full documentation for strive-sync](README_sync.md)**
 
