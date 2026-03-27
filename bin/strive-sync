@@ -28,6 +28,7 @@ SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 if [ -f "$SCRIPT_DIR/../lib/common.sh" ]; then
     source "$SCRIPT_DIR/../lib/common.sh"
+    [ -f "$SCRIPT_DIR/../lib/interactive.sh" ] && source "$SCRIPT_DIR/../lib/interactive.sh"
 else
     echo "Error: lib/common.sh not found (resolved script dir: $SCRIPT_DIR)"
     exit 1
@@ -37,7 +38,7 @@ fi
 # To release: git tag v1.0.2 -m "..." && git push --tags
 _TAGGED=$(git -C "$SCRIPT_DIR" describe --tags --exact-match 2>/dev/null)
 VERSION="${_TAGGED#v}"
-[ -z "$VERSION" ] && VERSION="1.0.1"
+[ -z "$VERSION" ] && VERSION="1.2.0"
 
 CONFIG_FILE=".repos"
 MAX_PARALLEL=4
@@ -72,6 +73,8 @@ AUTO_INSTALL=false
 FORCE_SYNC=false
 DRY_RUN=false
 BRANCH_OVERRIDDEN=false
+MIGRATE_TO_MAIN=false
+NON_INTERACTIVE=false
 EXCLUDED_REPOS=()
 EXCLUSIVE_REPO=""
 
@@ -83,10 +86,12 @@ show_help() {
     echo -e "  -o, --only <repo>       Sync ONLY this specific repository"
     echo -e "  -e, --exclude <repo>    Exclude a specific repository from syncing"
     echo -e "  -b, --branch <name>     Override auto-detected branch for all repos"
-    echo -e "  -d, --dry-run           Show what would be synced without making changes"
-    echo -e "  -i, --install           Install dependencies when lockfiles change"
-    echo -e "  -f, --force             Force dependency install regardless of lockfile changes"
+    echo -e "  -d, --dry-run           Dryrun: show changes without making them"
+    echo -e "  -i, --install           Install packages if lockfiles changed"
+    echo -e "  -m, --main              Switch to Main branch before syncing"
+    echo -e "  -f, --force             Force Everything: pull and reinstall even if up-to-date"
     echo -e "  -p, --parallel <num>    Max parallel processes (default: 4)"
+    echo -e "  -y, --yes               Non-interactive mode: bypass interactive briefing"
     echo -e "  -v, --version           Show version and exit"
     echo -e "  -h, --help              Show this help menu"
     echo ""
@@ -124,14 +129,18 @@ process_sync() {
     local log_file="$LOG_DIR/$(echo "$repo" | sed 's|/|__|g').log"
 
     # Branch precedence: .repos file → -b flag → auto-detected remote HEAD
-    local branch
+    local target_branch
     if [ "$branch_in_file" != "$repo" ]; then
-        branch="$branch_in_file"
+        target_branch="$branch_in_file"
     elif [ "$BRANCH_OVERRIDDEN" == "true" ]; then
-        branch="$DEFAULT_BRANCH"
+        target_branch="$DEFAULT_BRANCH"
     else
-        branch=$(detect_default_branch "$repo")
+        target_branch=$(detect_default_branch "$repo")
     fi
+
+    local current_branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    local original_branch="$current_branch"
+    local migration_status=""
 
     update_status "$repo" "${CYAN}[STARTING]${NC} Initializing..."
 
@@ -140,31 +149,54 @@ process_sync() {
         return 1
     fi
 
-    local current_branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
-
     # Leave dirty repos untouched — developer must resolve manually
     if [ -n "$(git -C "$repo" status --short)" ]; then
         update_status "$repo" "${YELLOW}[DIRTY   ]${NC} $current_branch"
         return 0
     fi
 
+    # [V1.1] Smart Switch: Migrating to target branch if clean
+    if [ "$MIGRATE_TO_MAIN" == "true" ] && [ "$current_branch" != "$target_branch" ]; then
+        if [ "$DRY_RUN" == "true" ]; then
+            update_status "$repo" "${CYAN}[CHECKOUT]${NC} (DRY RUN) $original_branch ➔ $target_branch"
+            current_branch="$target_branch"
+            migration_status="$original_branch ➔ "
+        else
+            update_status "$repo" "${CYAN}[CHECKOUT]${NC} $original_branch ➔ $target_branch"
+            if git -C "$repo" checkout "$target_branch" >> "$log_file" 2>&1; then
+                current_branch="$target_branch"
+                migration_status="$original_branch ➔ "
+            else
+                update_status "$repo" "${RED}[SKIP-DIR]${NC} $current_branch (dirty?)"
+                return 1
+            fi
+        fi
+    fi
+
     if [ "$DRY_RUN" == "true" ]; then
-        update_status "$repo" "${CYAN}[FETCHING]${NC} (DRY RUN) $branch"
+        update_status "$repo" "${CYAN}[FETCHING]${NC} (DRY RUN) $current_branch"
         sleep 0.5
     else
-        update_status "$repo" "${CYAN}[FETCHING]${NC} $branch..."
-        if ! git -C "$repo" fetch --quiet origin "$branch" 2>"$log_file"; then
+        update_status "$repo" "${CYAN}[FETCHING]${NC} $current_branch..."
+        if ! git -C "$repo" fetch --quiet origin "$target_branch" 2>"$log_file"; then
             update_status "$repo" "${RED}[FAILED  ]${NC} Fetch error"
             return 1
         fi
     fi
 
-    LOCAL=$(git -C "$repo" rev-parse HEAD 2>/dev/null)
-    UPSTREAM=$(git -C "$repo" rev-parse --abbrev-ref @{u} 2>/dev/null || echo "origin/$branch")
+    if [ "$DRY_RUN" == "true" ] && [ "$MIGRATE_TO_MAIN" == "true" ]; then
+        # In dry run migration, compare the actual target branch hash (if it exists) to remote
+        LOCAL=$(git -C "$repo" rev-parse "$target_branch" 2>/dev/null || git -C "$repo" rev-parse HEAD 2>/dev/null)
+    else
+        LOCAL=$(git -C "$repo" rev-parse HEAD 2>/dev/null)
+    fi
+
+    # Upstream calculation for the target branch
+    UPSTREAM=$(git -C "$repo" rev-parse --abbrev-ref "$target_branch"@{u} 2>/dev/null || echo "origin/$target_branch")
     REMOTE=$(git -C "$repo" rev-parse "$UPSTREAM" 2>/dev/null)
 
     if [ "$LOCAL" == "$REMOTE" ] && [ "$FORCE_SYNC" == "false" ]; then
-        update_status "$repo" "${GREEN}[SYNCED  ]${NC} $branch"
+        update_status "$repo" "${GREEN}[SYNCED  ]${NC} $migration_status$current_branch"
         return 0
     fi
 
@@ -172,17 +204,19 @@ process_sync() {
     if [ "$DRY_RUN" == "true" ]; then
         update_status "$repo" "${BLUE}[UPDATING]${NC} (DRY RUN) Merging..."
         sleep 0.5
+    elif git -C "$repo" merge-base --is-ancestor "$REMOTE" "$LOCAL" 2>/dev/null; then
+        update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch (ahead)"
     elif git -C "$repo" merge-base --is-ancestor "$LOCAL" "$REMOTE" 2>/dev/null; then
         update_status "$repo" "${BLUE}[UPDATING]${NC} Fast-forwarding..."
         git -C "$repo" merge --quiet --ff-only "$UPSTREAM" >> "$log_file" 2>&1
     else
-        update_status "$repo" "${RED}[OUT SYNC]${NC} $branch (rebase req)"
+        update_status "$repo" "${RED}[OUT SYNC]${NC} $migration_status$current_branch (rebase req)"
         return 1
     fi
 
     # Dependency install is opt-in (-i or -f) — never runs silently by default
     if [ "$AUTO_INSTALL" == "false" ] && [ "$FORCE_SYNC" == "false" ]; then
-        update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch"
+        update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch"
         return 0
     fi
 
@@ -193,7 +227,7 @@ process_sync() {
         if [ "$DRY_RUN" == "true" ]; then
             update_status "$repo" "${PURPLE}[DEPS    ]${NC} (DRY RUN) Installing..."
             sleep 0.5
-            update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch (dry run)"
+            update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch (dry run)"
         else
             # Pick the package manager by the most recently modified lockfile
             NEWEST_LOCK=$(ls -1t \
@@ -203,23 +237,23 @@ process_sync() {
             if [[ "$NEWEST_LOCK" == *"yarn.lock" ]]; then
                 update_status "$repo" "${PURPLE}[YARN    ]${NC} Installing..."
                 (cd "$repo" || return; yarn --silent --non-interactive) >> "$log_file" 2>&1
-                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch + yarn"
+                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + yarn"
             elif [[ "$NEWEST_LOCK" == *"pnpm-lock.yaml" ]]; then
                 update_status "$repo" "${PURPLE}[PNPM    ]${NC} Installing..."
                 (cd "$repo" || return; pnpm install --silent) >> "$log_file" 2>&1
-                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch + pnpm"
+                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + pnpm"
             elif [[ "$NEWEST_LOCK" == *"bun.lockb" ]]; then
                 update_status "$repo" "${PURPLE}[BUN     ]${NC} Installing..."
                 (cd "$repo" || return; bun install --silent) >> "$log_file" 2>&1
-                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch + bun"
+                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + bun"
             elif [[ "$NEWEST_LOCK" == *"package-lock.json" ]] || [ -f "$repo/package.json" ]; then
                 update_status "$repo" "${PURPLE}[NPM     ]${NC} Installing..."
                 (cd "$repo" || return; npm install --silent) >> "$log_file" 2>&1
-                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch + npm"
+                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + npm"
             fi
         fi
     else
-        update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch"
+        update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch"
     fi
 }
 
@@ -227,6 +261,7 @@ process_sync() {
 # MAIN
 # ============================================================================
 
+ORIG_ARG_COUNT=$#
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -h|--help)     show_help; exit 0 ;;
@@ -235,9 +270,11 @@ while [[ "$#" -gt 0 ]]; do
         -b|--branch)   DEFAULT_BRANCH="$2"; BRANCH_OVERRIDDEN=true; shift ;;
         -o|--only)     EXCLUSIVE_REPO="$2"; shift ;;
         -i|--install)  AUTO_INSTALL=true ;;
+        -m|--main)     MIGRATE_TO_MAIN=true ;;
         -f|--force)    FORCE_SYNC=true ;;
         -d|--dry-run)  DRY_RUN=true ;;
         -e|--exclude)  EXCLUDED_REPOS+=("$2"); shift ;;
+        -y|--yes)      NON_INTERACTIVE=true ;;
         *) echo -e "${RED}Unknown parameter: $1${NC}"; show_help; exit 1 ;;
     esac
     shift
@@ -266,17 +303,25 @@ elif [ -f "$CONFIG_FILE" ]; then
     done < "$CONFIG_FILE"
 else
     REPOS=()
+    echo -ne "${CYAN}Scanning workspace...${NC}\r"
     while IFS= read -r dir; do
         is_excluded "$dir" && continue
         REPOS+=("$dir")
-    done < <(find . -maxdepth 5 -name ".git" -type d 2>/dev/null \
-             | sed 's|/\.git$||' | sed 's|^\./||')
+    done < <(find . -maxdepth 5 \( -name "node_modules" -o -name ".next" -o -name "vendor" \) -prune -o -name ".git" -type d -print 2>/dev/null \
+             | sed 's|/\.git$||' | sed 's|^\./||' | sort -u)
+    echo -ne "\033[K" # Clear the scanning message
 fi
 
 if [ ${#REPOS[@]} -eq 0 ]; then
     echo -e "${YELLOW}No Git repositories found in the current directory.${NC}"
     echo -e "Tip: Run from your workspace root, or create a ${BOLD}.repos${NC} file."
     exit 1
+fi
+
+# INTERACTIVE MISSION BRIEFING (Pre-flight Review)
+# Triggered if in a terminal and not explicitly silenced with -y/--yes.
+if [ "$NON_INTERACTIVE" == "false" ] && [ -t 0 ]; then
+    show_mission_briefing "$MIGRATE_TO_MAIN" "$AUTO_INSTALL" "$FORCE_SYNC" "$DRY_RUN" "${REPOS[@]}"
 fi
 
 touch "$STATUS_DIR/active"

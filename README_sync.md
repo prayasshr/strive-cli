@@ -1,4 +1,4 @@
-# 🚀 Strive-Sync (v1.0.1)
+# 🚀 Strive-Sync (v1.2.0)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Version](https://img.shields.io/github/v/tag/prayasshr/strive-cli?label=version&color=brightgreen)](https://github.com/prayasshr/strive-cli/releases)
@@ -12,6 +12,10 @@
 
 If you work in a microservices architecture or a distributed workspace, `strive-sync` saves you from the manual `git pull` and `npm install` loop.
 
+![Mission Briefing — configure and review your sync before launch](assets/mission-briefing.png)
+
+![Mission Control HUD — live sync status across all repositories](assets/mission-control.png)
+
 ---
 
 ## ✨ Features
@@ -19,13 +23,14 @@ If you work in a microservices architecture or a distributed workspace, `strive-
 - 🏎️ **Parallel Execution**: Syncs all repositories concurrently.
 - 🎛️ **Mission Control Dashboard**: Real-time visual tracking for sync status, dirty states, and updates.
 - 🧠 **Smart Branch Detection**: Automatically detects each repo's default branch from its remote HEAD reference — no hardcoding of `main` or `master`.
-- 📦 **Opt-in Dependency Sync**: Use `--install` to run the correct package manager (`npm`, `yarn`, `pnpm`, or `bun`) when lockfiles change. Off by default so you're never surprised mid-development.
+- 📦 **Install Packages**: Use `--install` (`-i`) to update dependencies only when lockfiles change.
 - 🎯 **Pinpoint Controls**:
   - `--only <repo>`: Sync ONLY the specified repository.
-  - `--branch <name>`: Override the detected branch across all repos.
-  - `--dry-run` (`-d`): Simulation mode to preview changes.
-  - `--install` (`-i`): Opt-in to automatic dependency installation.
-  - `--force` (`-f`): Force dependency install regardless of lockfile diffs.
+  - `--branch <name>` (`-b`): Override the target branch for all repos.
+  - `--main` (`-m`): **Switch to Main** branch if current branch is clean.
+  - `--dry-run` (`-d`): **Dryrun Preview** mode to simulate changes.
+  - `--install` (`-i`): **Install Packages** if lockfiles change.
+  - `--force` (`-f`): **Force Everything** (Full pull and reinstall even if up-to-date).
 - 🛡️ **Secure Architecture**: POSIX-compliant directory parsing, dynamic Git upstream tracking, and `mktemp`-based temp directories to prevent auth hangs.
 - 🗂️ **Clean State Storage**: Persists mission memory to `$XDG_STATE_HOME/strive-sync/last_sync` (defaults to `~/.local/state/strive-sync/last_sync`), keeping your home directory clean.
 - ⚙️ **Zero Config**: Runs out of the box — no configuration needed.
@@ -57,24 +62,44 @@ strive-sync --force
 | `--only <repo>` | `-o` | Sync ONLY the specified repository. |
 | `--exclude <repo>` | `-e` | Skip a specific repository. |
 | `--branch <name>` | `-b` | Override the target branch for all repos. |
-| `--dry-run` | `-d` | Simulate the sync process without making changes. |
-| `--install` | `-i` | Opt-in to automatic dependency installation when lockfiles change. |
-| `--force` | `-f` | Force re-installation of dependencies regardless of lockfile diffs. |
+| `--dry-run` | `-d` | Dryrun Preview: simulate changes without applying them. |
+| `--install` | `-i` | Install Packages only if lockfiles change. |
+| `--main` | `-m` | Switch to Main branch (if clean) before syncing. |
+| `--force` | `-f` | Force Everything: pull and reinstall even if up-to-date. |
 | `--parallel <num>` | `-p` | Max parallel processes (default: 4). |
+| `--yes` | `-y` | Non-interactive mode: bypass interactive briefing. |
 | `--version` | `-v` | Print version and exit. |
 | `--help` | `-h` | Display the help menu. |
 
-## 🛠️ Configuration (Optional)
+## 🧠 Why Strive-Sync? (Real World Use Cases)
 
-`strive-sync` automatically discovers repositories in your workspace. For strict control, create a `.repos` file in your workspace root:
+Managing a single repository is easy. Managing ten, twenty, or fifty at once is where things get messy. Strive-Sync was built to handle the chaos and give you a clear view of your entire workspace in seconds.
+
+*   **The Morning Routine**: Run `strive-sync` first thing in the morning to pull updates for every service in your ecosystem. You'll catch upstream changes before they break your local build.
+*   **The Big Migration**: Use `--main` or `-m` to safely switch all your clean repositories back to their default branches (like `main` or `master`) in a single pass.
+*   **The Dependency Refresh**: When your team updates a shared library, use `--install` or `-i`. Strive-Sync is smart enough to only run `npm install` or `yarn` if the lockfiles actually changed, saving you minutes of waiting.
+
+## 📡 Interactive Mission Control (Pre-Flight Review)
+
+Strive-Sync now defaults to **Interactive Mission Control** whenever you run it in a terminal. Even if you pass command-line flags, the tool offers a **Pre-Flight Review** screen. Any flags you provided (like `--main` or `--force`) are pre-selected in the UI, giving you a final chance to review your mission parameters and select exactly which repositories to sync before hitting ENTER to launch.
+
+> [!TIP]
+> **Pro-Tip: Use `.repos` for Speed.** If you have a large workspace, the directory scanner can take a few seconds to find all your Git projects. Creating a `.repos` file in your root directory is **strongly recommended**—it bypasses the scan entirely, resulting in an instant mission launch.
+
+To bypass all interactive prompts (e.g., in CI/CD or for expert fast-launch), use the `--yes` (`-y`) flag.
+
+## 🛠️ The Power of .repos (Optional)
+
+`strive-sync` automatically discovers repositories in your workspace. For surgical control, create a `.repos` file in your workspace root. You can pin specific services to specific branches while letting others follow their default remote.
 
 ```text
 # .repos format: <repo_name>[:<target_branch>]
-auth-service:main
-frontend-app:master
-shared-ui:develop
-legacy-api  # Defaults to the auto-detected remote HEAD branch
+webapps:feat/mobile-redesign  # Stay on this feature branch
+auth-service:main             # Always track main
+plutus                        # Auto-detect the default remote branch
 ```
+
+This flexibility lets you tailor your sync mission to exactly what you're working on today.
 
 ## 🏷️ Versioning
 

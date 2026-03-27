@@ -34,7 +34,7 @@ get_power_icon() {
             icon="[🔋]"
         fi
     fi
-    echo "$icon"
+    printf "%s" "$icon"
 }
 
 get_relative_time() {
@@ -59,6 +59,34 @@ update_status() {
     echo -e "$status_text" > "$STATUS_DIR/$status_file"
 }
 
+# Truncates long paths while preserving the repo name (Identity-First)
+# Format: "products/mob.../nurse-ledger" (max 35)
+truncate_repo_path() {
+    local str="$1"
+    local max=35
+    if [ ${#str} -le $max ] || [[ "$str" != *"/"* ]]; then
+        echo "$str"
+        return
+    fi
+
+    local repo="${str##*/}"
+    local path="${str%/*}"
+    local available=$((max - ${#repo} - 1)) # -1 for the slash
+
+    if [ $available -lt 5 ]; then
+        # Not enough room for path prefix, show as much as possible with ...
+        if [ ${#repo} -ge $((max - 3)) ]; then
+            echo "$repo" # Never truncate repo
+        else
+            echo ".../$repo"
+        fi
+    else
+        # Show first N chars of path + ... + / + repo
+        local truncated_path="${path:0:$((available-3))}..."
+        echo "$truncated_path/$repo"
+    fi
+}
+
 # Live terminal HUD — runs as a background job (`render_dashboard &`).
 #
 # Reserves vertical space, then loops every 200ms reading $STATUS_DIR files
@@ -79,6 +107,18 @@ render_dashboard() {
 
     # Reserve vertical space in the terminal for the HUD block
     for (( i=0; i < num_items + header_lines; i++ )); do echo ""; done
+
+    # Calculate dynamic width for the repo column based on longest name (max 35)
+    local max_width=15
+    for (( i=0; i < num_items; i++ )); do
+        local item="${REPOS[$i]}"
+        local repo=$(echo "$item" | cut -d: -f1)
+        local display_name="$repo"
+        [ "$repo" == "." ] && display_name=$(basename "$PWD")
+        local name_len=${#display_name}
+        [ $name_len -gt $max_width ] && max_width=$name_len
+    done
+    [ $max_width -gt 35 ] && max_width=35
 
     while [ -f "$STATUS_DIR/active" ]; do
         printf "\033[%dA" "$((num_items + header_lines))"
@@ -107,27 +147,42 @@ render_dashboard() {
         [ "$dirty_count"  -gt 0 ] && [ "$failed_count" -eq 0 ] && bar_color="${YELLOW}"
 
         # \033[K erases to end of line — clears stale chars from previous renders
-        echo -e "${CYAN}${BOLD}${BATT_ICON} $MISSION_TITLE${NC} | v$VERSION\033[K"
-        echo -e "${PURPLE}${LAST_MISSION_STR}${NC}\033[K"
-        echo -e "${BOLD}HEALTH: ${bar_color}${bar}${NC} ${BOLD}${pct}% | SYNCED: ${success_count} | DIRTY: ${dirty_count} | FAILED: ${failed_count}${NC}\033[K"
-        echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}\033[K"
+        printf "${CYAN}${BOLD}%s %s${NC} | v%s\033[K\n" "$BATT_ICON" "$MISSION_TITLE" "$VERSION"
+        printf "${PURPLE}%s${NC}\033[K\n" "$LAST_MISSION_STR"
+        printf "${BOLD}HEALTH: ${bar_color}%s${NC} ${BOLD}%s%% | SYNCED: %s | DIRTY: %s | FAILED: %s${NC}\033[K\n" "$bar" "$pct" "$success_count" "$dirty_count" "$failed_count"
+        printf "${BLUE}────────────────────────────────────────────────────────────${NC}\033[K\n"
 
         for (( i=0; i < num_items; i++ )); do
             local item="${REPOS[$i]}"
-            local display_name="$item"
-            [ "$item" == "." ] && display_name=$(basename "$PWD")
-            local status_file=$(echo "$item" | sed 's|/|__|g')
-            [ "$item" == "." ] && status_file="__root__"
+            local repo=$(echo "$item" | cut -d: -f1)
+            local display_name=$(truncate_repo_path "$repo")
+            [ "$repo" == "." ] && display_name=$(basename "$PWD")
+
+            local status_file=$(echo "$repo" | sed 's|/|__|g')
+            [ "$repo" == "." ] && status_file="__root__"
+
             local status
             status=$(cat "$STATUS_DIR/$status_file" 2>/dev/null \
                      || echo -e "${NC}[WAITING ] Waiting...${NC}")
-            printf "   %-15s | %b\033[K\n" "$display_name" "$status"
+            printf "   %-${max_width}s | %b\033[K\n" "$display_name" "$status"
         done
 
         sleep 0.2
     done
 
     # Final render — locks in the terminal state before cleanup prints below it
+    # Recalculate dynamic width for the repo column if needed (max 35)
+    local max_width=15
+    for (( i=0; i < num_items; i++ )); do
+        local item="${REPOS[$i]}"
+        local repo=$(echo "$item" | cut -d: -f1)
+        local display_name="$repo"
+        [ "$repo" == "." ] && display_name=$(basename "$PWD")
+        local name_len=${#display_name}
+        [ $name_len -gt $max_width ] && max_width=$name_len
+    done
+    [ $max_width -gt 35 ] && max_width=35
+
     printf "\033[%dA" "$((num_items + header_lines))"
 
     local contents=$(cat "$STATUS_DIR"/* 2>/dev/null)
@@ -153,21 +208,24 @@ render_dashboard() {
     [ "$failed_count" -gt 0 ] && bar_color="${RED}"
     [ "$dirty_count"  -gt 0 ] && [ "$failed_count" -eq 0 ] && bar_color="${YELLOW}"
 
-    echo -e "${CYAN}${BOLD}${BATT_ICON} $MISSION_TITLE${NC} | v$VERSION\033[K"
-    echo -e "${PURPLE}${LAST_MISSION_STR}${NC}\033[K"
-    echo -e "${BOLD}HEALTH: ${bar_color}${bar}${NC} ${BOLD}${pct}% | SYNCED: ${success_count} | DIRTY: ${dirty_count} | FAILED: ${failed_count}${NC}\033[K"
-    echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}\033[K"
+    printf "${CYAN}${BOLD}%s %s${NC} | v%s\033[K\n" "$BATT_ICON" "$MISSION_TITLE" "$VERSION"
+    printf "${PURPLE}%s${NC}\033[K\n" "$LAST_MISSION_STR"
+    printf "${BOLD}HEALTH: ${bar_color}%s${NC} ${BOLD}%s%% | SYNCED: %s | DIRTY: %s | FAILED: %s${NC}\033[K\n" "$bar" "$pct" "$success_count" "$dirty_count" "$failed_count"
+    printf "${BLUE}────────────────────────────────────────────────────────────${NC}\033[K\n"
 
     for (( i=0; i < num_items; i++ )); do
         local item="${REPOS[$i]}"
-        local display_name="$item"
-        [ "$item" == "." ] && display_name=$(basename "$PWD")
-        local status_file=$(echo "$item" | sed 's|/|__|g')
-        [ "$item" == "." ] && status_file="__root__"
+        local repo=$(echo "$item" | cut -d: -f1)
+        local display_name=$(truncate_repo_path "$repo")
+        [ "$repo" == "." ] && display_name=$(basename "$PWD")
+
+        local status_file=$(echo "$repo" | sed 's|/|__|g')
+        [ "$repo" == "." ] && status_file="__root__"
+
         local status
         status=$(cat "$STATUS_DIR/$status_file" 2>/dev/null \
                  || echo -e "${NC}[WAITING ] Waiting...${NC}")
-        printf "   %-15s | %b\033[K\n" "$display_name" "$status"
+        printf "   %-${max_width}s | %b\033[K\n" "$display_name" "$status"
     done
 
     safe_tput cnorm 2>/dev/null
