@@ -1,12 +1,23 @@
 #!/bin/bash
 
-# ======================================================================
+# ============================================================================
 # STRIVE-SYNC: Mission Control for Your Workspace
 # Parallel Repository Synchronizer with Live Dashboard
-# Striving Designs | Prayas Shrestha
-# ======================================================================
+#
+# A Striving Designs open-source tool — strivingdesigns.com
+# Built by Prayas Shrestha · github.com/prayasshr/strive-cli
+# License: MIT
+# ============================================================================
+#
+# ARCHITECTURE
+#   Main process   → parses flags, discovers repos, dispatches workers
+#   Worker jobs    → one background process per repo; writes status to $STATUS_DIR
+#   Dashboard job  → reads $STATUS_DIR files every 200ms, redraws the HUD
+#   Cleanup (trap) → removes $STATUS_DIR/active to signal the dashboard, then
+#                    calls `wait $DASHBOARD_PID` (not sleep+kill) so the final
+#                    render completes before anything else prints to stdout
+# ============================================================================
 
-# Resolve the real script location (handles symlinks)
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
     DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
@@ -22,8 +33,8 @@ else
     exit 1
 fi
 
-# Version: auto-reads from the nearest git tag when tagged exactly.
-# To release a new version: git tag v1.0.2 && git push --tags
+# Auto-read version from the nearest annotated git tag on an exact match.
+# To release: git tag v1.0.2 -m "..." && git push --tags
 _TAGGED=$(git -C "$SCRIPT_DIR" describe --tags --exact-match 2>/dev/null)
 VERSION="${_TAGGED#v}"
 [ -z "$VERSION" ] && VERSION="1.0.1"
@@ -34,15 +45,13 @@ MAX_PARALLEL=4
 MISSION_TITLE="STRIVE-SYNC MISSION CONTROL"
 BATT_ICON=$(get_power_icon)
 
-# Performance Tracking & Memory
 START_TIME=$(perl -e 'use Time::HiRes qw(time); print time' 2>/dev/null || date +%s)
 
-# XDG-compliant state directory (keeps $HOME clean)
+# XDG-compliant state dir — keeps $HOME clean
 MEMORY_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/strive-sync"
 MEMORY_FILE="$MEMORY_DIR/last_sync"
 mkdir -p "$MEMORY_DIR"
 
-# Secure, isolated temporary directories
 STATUS_DIR=$(mktemp -d -t strive_sync.XXXXXX) || exit 1
 LOG_DIR=$(mktemp -d -t strive_sync_logs.XXXXXX) || exit 1
 
@@ -55,19 +64,17 @@ else
     LAST_MISSION_STR="LAST MISSION: Never"
 fi
 
-# Git Background Safety
+# Prevent git from hanging on credential prompts inside background workers
 export GIT_TERMINAL_PROMPT=0
 export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
 
-# Surgical Flags
-AUTO_INSTALL=false      # Opt-in: -i/--install to run package installs on lockfile changes
-FORCE_SYNC=false        # -f/--force to force install regardless of lockfile diff
+AUTO_INSTALL=false
+FORCE_SYNC=false
 DRY_RUN=false
-BRANCH_OVERRIDDEN=false # true when user passes -b
+BRANCH_OVERRIDDEN=false
 EXCLUDED_REPOS=()
 EXCLUSIVE_REPO=""
 
-# Help Menu
 show_help() {
     echo -e "${CYAN}${BOLD}STRIVE-SYNC | v$VERSION${NC} - Workspace Mission Control\n"
     echo -e "Usage: strive-sync [options]"
@@ -80,6 +87,7 @@ show_help() {
     echo -e "  -i, --install           Install dependencies when lockfiles change"
     echo -e "  -f, --force             Force dependency install regardless of lockfile changes"
     echo -e "  -p, --parallel <num>    Max parallel processes (default: 4)"
+    echo -e "  -v, --version           Show version and exit"
     echo -e "  -h, --help              Show this help menu"
     echo ""
     echo -e "${CYAN}${BOLD}Discovery:${NC}"
@@ -87,39 +95,35 @@ show_help() {
     echo -e "  Create a ${BOLD}.repos${NC} file for explicit repo:branch control."
     echo ""
     echo -e "  --"
-    echo -e "  Built by Prayas Shrestha"
-    echo -e "  Discover more at: ${CYAN}strivingdesigns.com${NC}"
+    echo -e "  A ${CYAN}Striving Designs${NC} open-source tool · strivingdesigns.com"
+    echo -e "  by Prayas Shrestha · github.com/prayasshr"
     echo ""
 }
 
-# Detect the default branch of a repo from the remote's HEAD reference.
-# Uses local symbolic-ref first (fast), falls back to a remote query if not set.
+# Determines a repo's default branch without hardcoding main/master.
+# 1. Reads refs/remotes/origin/HEAD (local, zero network)
+# 2. Falls back to `git remote show origin` (one network round-trip)
 detect_default_branch() {
     local repo=$1
     local branch
-
-    # Fast path: reads the symref set by `git remote set-head origin --auto`
-    branch=$(git -C "$repo" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|^refs/remotes/origin/||')
-
-    # Slow path: query the remote directly (network call, only if needed)
+    branch=$(git -C "$repo" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+             | sed 's|^refs/remotes/origin/||')
     if [ -z "$branch" ]; then
-        branch=$(git -C "$repo" remote show origin 2>/dev/null | awk '/HEAD branch/ {print $NF}')
+        branch=$(git -C "$repo" remote show origin 2>/dev/null \
+                 | awk '/HEAD branch/ {print $NF}')
     fi
-
     echo "${branch:-main}"
 }
 
-# Individual Repo Processor
+# Worker function — runs as a background job, one per repo.
+# Writes status updates to $STATUS_DIR; never touches stdout directly.
 process_sync() {
     local repo_info=$1
     local repo=$(echo "$repo_info" | cut -d: -f1)
     local branch_in_file=$(echo "$repo_info" | cut -d: -f2)
     local log_file="$LOG_DIR/$(echo "$repo" | sed 's|/|__|g').log"
 
-    # Determine effective branch with clear precedence:
-    # 1. Per-repo branch in .repos file (repo:branch format)
-    # 2. Global -b/--branch flag from user
-    # 3. Auto-detected from remote (symbolic-ref)
+    # Branch precedence: .repos file → -b flag → auto-detected remote HEAD
     local branch
     if [ "$branch_in_file" != "$repo" ]; then
         branch="$branch_in_file"
@@ -138,13 +142,12 @@ process_sync() {
 
     local current_branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
 
-    # Check Dirty State
+    # Leave dirty repos untouched — developer must resolve manually
     if [ -n "$(git -C "$repo" status --short)" ]; then
         update_status "$repo" "${YELLOW}[DIRTY   ]${NC} $current_branch"
         return 0
     fi
 
-    # Fetch Updates
     if [ "$DRY_RUN" == "true" ]; then
         update_status "$repo" "${CYAN}[FETCHING]${NC} (DRY RUN) $branch"
         sleep 0.5
@@ -156,7 +159,6 @@ process_sync() {
         fi
     fi
 
-    # Compare and Sync
     LOCAL=$(git -C "$repo" rev-parse HEAD 2>/dev/null)
     UPSTREAM=$(git -C "$repo" rev-parse --abbrev-ref @{u} 2>/dev/null || echo "origin/$branch")
     REMOTE=$(git -C "$repo" rev-parse "$UPSTREAM" 2>/dev/null)
@@ -166,6 +168,7 @@ process_sync() {
         return 0
     fi
 
+    # Only fast-forward — never rebase or reset automatically
     if [ "$DRY_RUN" == "true" ]; then
         update_status "$repo" "${BLUE}[UPDATING]${NC} (DRY RUN) Merging..."
         sleep 0.5
@@ -177,19 +180,25 @@ process_sync() {
         return 1
     fi
 
-    # Dependency Sync — only runs if user opted in via -i or -f
+    # Dependency install is opt-in (-i or -f) — never runs silently by default
     if [ "$AUTO_INSTALL" == "false" ] && [ "$FORCE_SYNC" == "false" ]; then
         update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch"
         return 0
     fi
 
-    if ! git -C "$repo" diff --quiet HEAD@{1} HEAD -- yarn.lock package-lock.json pnpm-lock.yaml bun.lockb package.json || [ "$FORCE_SYNC" == "true" ]; then
+    if ! git -C "$repo" diff --quiet HEAD@{1} HEAD \
+         -- yarn.lock package-lock.json pnpm-lock.yaml bun.lockb package.json \
+         || [ "$FORCE_SYNC" == "true" ]; then
+
         if [ "$DRY_RUN" == "true" ]; then
-             update_status "$repo" "${PURPLE}[DEPS    ]${NC} (DRY RUN) Installing..."
-             sleep 0.5
-             update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch (dry run)"
+            update_status "$repo" "${PURPLE}[DEPS    ]${NC} (DRY RUN) Installing..."
+            sleep 0.5
+            update_status "$repo" "${GREEN}[SUCCESS ]${NC} $branch (dry run)"
         else
-            NEWEST_LOCK=$(ls -1t "$repo"/yarn.lock "$repo"/package-lock.json "$repo"/pnpm-lock.yaml "$repo"/bun.lockb 2>/dev/null | head -n 1)
+            # Pick the package manager by the most recently modified lockfile
+            NEWEST_LOCK=$(ls -1t \
+                "$repo"/yarn.lock "$repo"/package-lock.json \
+                "$repo"/pnpm-lock.yaml "$repo"/bun.lockb 2>/dev/null | head -n 1)
 
             if [[ "$NEWEST_LOCK" == *"yarn.lock" ]]; then
                 update_status "$repo" "${PURPLE}[YARN    ]${NC} Installing..."
@@ -214,25 +223,26 @@ process_sync() {
     fi
 }
 
-# --- Main Entry ---
+# ============================================================================
+# MAIN
+# ============================================================================
 
-# Parse args
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        -h|--help) show_help; exit 0 ;;
+        -h|--help)     show_help; exit 0 ;;
+        -v|--version)  echo "strive-sync v$VERSION · A Striving Designs tool by Prayas Shrestha · strivingdesigns.com"; exit 0 ;;
         -p|--parallel) MAX_PARALLEL="$2"; shift ;;
-        -b|--branch) DEFAULT_BRANCH="$2"; BRANCH_OVERRIDDEN=true; shift ;;
-        -o|--only) EXCLUSIVE_REPO="$2"; shift ;;
-        -i|--install) AUTO_INSTALL=true ;;
-        -f|--force) FORCE_SYNC=true ;;
-        -d|--dry-run) DRY_RUN=true ;;
-        -e|--exclude) EXCLUDED_REPOS+=("$2"); shift ;;
+        -b|--branch)   DEFAULT_BRANCH="$2"; BRANCH_OVERRIDDEN=true; shift ;;
+        -o|--only)     EXCLUSIVE_REPO="$2"; shift ;;
+        -i|--install)  AUTO_INSTALL=true ;;
+        -f|--force)    FORCE_SYNC=true ;;
+        -d|--dry-run)  DRY_RUN=true ;;
+        -e|--exclude)  EXCLUDED_REPOS+=("$2"); shift ;;
         *) echo -e "${RED}Unknown parameter: $1${NC}"; show_help; exit 1 ;;
     esac
     shift
 done
 
-# Defaults & Constraints
 [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
 
 is_excluded() {
@@ -243,7 +253,8 @@ is_excluded() {
     return 1
 }
 
-# Discovery
+# Discovery: --only → .repos file → auto-find .git dirs (up to depth 5)
+# No automatic parent-directory pivot — if no repos are found here, we say so.
 if [ -n "$EXCLUSIVE_REPO" ]; then
     REPOS=("$EXCLUSIVE_REPO")
 elif [ -f "$CONFIG_FILE" ]; then
@@ -254,12 +265,12 @@ elif [ -f "$CONFIG_FILE" ]; then
         REPOS+=("$line")
     done < "$CONFIG_FILE"
 else
-    # Space-safe discovery (Bash 3/macOS compatible)
     REPOS=()
     while IFS= read -r dir; do
         is_excluded "$dir" && continue
         REPOS+=("$dir")
-    done < <(find . -maxdepth 5 -name ".git" -type d 2>/dev/null | sed 's|/\.git$||' | sed 's|^\./||')
+    done < <(find . -maxdepth 5 -name ".git" -type d 2>/dev/null \
+             | sed 's|/\.git$||' | sed 's|^\./||')
 fi
 
 if [ ${#REPOS[@]} -eq 0 ]; then
@@ -268,34 +279,33 @@ if [ ${#REPOS[@]} -eq 0 ]; then
     exit 1
 fi
 
-# Init dashboard state
 touch "$STATUS_DIR/active"
 for repo_info in "${REPOS[@]}"; do
     repo=$(echo "$repo_info" | cut -d: -f1)
     update_status "$repo" "${NC}[WAITING ] Waiting...${NC}"
 done
 
-# Start dashboard
 render_dashboard &
 DASHBOARD_PID=$!
 
-# Trap cleanup
 cleanup() {
     kill "${WORKER_PIDS[@]}" 2>/dev/null
+
+    # Let workers flush their final status writes before the dashboard renders
     sleep 0.5
     rm -f "$STATUS_DIR/active"
-    sleep 0.3
-    kill $DASHBOARD_PID 2>/dev/null
+
+    # Wait for the dashboard's final render to finish — do NOT use sleep+kill.
+    # A premature kill leaves the cursor mid-block, causing the MISSION COMPLETE
+    # line to overwrite repo rows (the "accordion collapse" bug).
+    wait $DASHBOARD_PID 2>/dev/null
     safe_tput cnorm 2>/dev/null
 
     END_TIME=$(perl -e 'use Time::HiRes qw(time); print time' 2>/dev/null || date +%s)
-    ELAPSED=$(echo "$END_TIME - $START_TIME" | bc 2>/dev/null || echo "$((END_TIME - START_TIME))")
+    ELAPSED=$(echo "$END_TIME - $START_TIME" | bc 2>/dev/null \
+              || echo "$((END_TIME - START_TIME))")
+    [[ $ELAPSED == *"."* ]] && ELAPSED=$(printf "%.2f" "$ELAPSED")
 
-    if [[ $ELAPSED == *"."* ]]; then
-        ELAPSED=$(printf "%.2f" "$ELAPSED")
-    fi
-
-    # Record mission memory (check status files BEFORE deleting them)
     local final_status="Success"
     if [ -d "$STATUS_DIR" ]; then
         if grep -qE '\[FAILED  \]|\[MISSING \]|\[OUT SYNC\]' "$STATUS_DIR"/* 2>/dev/null; then
@@ -307,25 +317,19 @@ cleanup() {
     echo "$(date +%s) $final_status" > "$MEMORY_FILE"
 
     rm -rf "$STATUS_DIR" "$LOG_DIR"
-
     echo -e "\n${BLUE}────────────────────────────────────────────────────────────${NC}"
     echo -e "${CYAN}${BOLD}MISSION COMPLETE in ${ELAPSED}s${NC}"
 }
 trap cleanup EXIT INT TERM
 
-# Run Sync Workers
 WORKER_PIDS=()
 for repo_info in "${REPOS[@]}"; do
     process_sync "$repo_info" &
     WORKER_PIDS+=($!)
-
-    # Limit parallelism
     while [ $(jobs -r | wc -l) -ge $((MAX_PARALLEL + 1)) ]; do
         sleep 0.1
     done
 done
 
-# Wait for all workers to finish
 wait "${WORKER_PIDS[@]}" 2>/dev/null
-
 exit 0

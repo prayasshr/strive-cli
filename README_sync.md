@@ -1,8 +1,8 @@
 # 🚀 Strive-Sync (v1.0.1)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.0.1-brightgreen.svg)]()
-[![Built by](https://img.shields.io/badge/Built_by-Striving_Designs-black.svg)]()
+[![Version](https://img.shields.io/github/v/tag/prayasshr/strive-cli?label=version&color=brightgreen)](https://github.com/prayasshr/strive-cli/releases)
+[![Built by](https://img.shields.io/badge/Built_by-Striving_Designs-black.svg)](https://strivingdesigns.com)
 
 > [!IMPORTANT]
 > **Project Status: Stable**
@@ -61,6 +61,7 @@ strive-sync --force
 | `--install` | `-i` | Opt-in to automatic dependency installation when lockfiles change. |
 | `--force` | `-f` | Force re-installation of dependencies regardless of lockfile diffs. |
 | `--parallel <num>` | `-p` | Max parallel processes (default: 4). |
+| `--version` | `-v` | Print version and exit. |
 | `--help` | `-h` | Display the help menu. |
 
 ## 🛠️ Configuration (Optional)
@@ -93,3 +94,10 @@ The script will automatically report the correct version on next run — no file
 | Last mission record | `~/.local/state/strive-sync/last_sync` |
 
 Respects `$XDG_STATE_HOME` if set in your environment.
+
+---
+
+<p align="center">
+  <b>Built by Prayas Shrestha</b><br>
+  <a href="https://strivingdesigns.com">strivingdesigns.com</a>
+</p>
