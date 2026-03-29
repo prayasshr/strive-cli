@@ -4,6 +4,7 @@
 # STRIVE-SYNC: Mission Control for Your Workspace
 # Parallel Repository Synchronizer with Live Dashboard
 #
+# 🚀 Strive-Sync (v1.3.0)
 # A Striving Designs open-source tool — strivingdesigns.com
 # Built by Prayas Shrestha · github.com/prayasshr/strive-cli
 # License: MIT
@@ -38,7 +39,7 @@ fi
 # To release: git tag v1.0.2 -m "..." && git push --tags
 _TAGGED=$(git -C "$SCRIPT_DIR" describe --tags --exact-match 2>/dev/null)
 VERSION="${_TAGGED#v}"
-[ -z "$VERSION" ] && VERSION="1.2.0"
+[ -z "$VERSION" ] && VERSION="1.3.0"
 
 CONFIG_FILE=".repos"
 MAX_PARALLEL=4
@@ -55,6 +56,7 @@ mkdir -p "$MEMORY_DIR"
 
 STATUS_DIR=$(mktemp -d -t strive_sync.XXXXXX) || exit 1
 LOG_DIR=$(mktemp -d -t strive_sync_logs.XXXXXX) || exit 1
+AUDIT_DIR=$(mktemp -d -t strive_sync_audit.XXXXXX) || exit 1
 
 if [ -f "$MEMORY_FILE" ]; then
     LAST_TIME=$(awk '{print $1}' "$MEMORY_FILE")
@@ -77,6 +79,8 @@ MIGRATE_TO_MAIN=false
 NON_INTERACTIVE=false
 EXCLUDED_REPOS=()
 EXCLUSIVE_REPO=""
+AUDIT_ENABLED=false
+AUDIT_FILE="AUDIT.md"
 
 show_help() {
     echo -e "${CYAN}${BOLD}STRIVE-SYNC | v$VERSION${NC} - Workspace Mission Control\n"
@@ -90,6 +94,7 @@ show_help() {
     echo -e "  -i, --install           Install packages if lockfiles changed"
     echo -e "  -m, --main              Switch to Main branch before syncing"
     echo -e "  -f, --force             Force Everything: pull and reinstall even if up-to-date"
+    echo -e "  -a, --audit             Generate AUDIT.md in the current directory"
     echo -e "  -p, --parallel <num>    Max parallel processes (default: 4)"
     echo -e "  -y, --yes               Non-interactive mode: bypass interactive briefing"
     echo -e "  -v, --version           Show version and exit"
@@ -138,6 +143,10 @@ process_sync() {
         target_branch=$(detect_default_branch "$repo")
     fi
 
+    # Audit Header
+    update_audit "$repo" "### Repo: **$repo**"
+    update_audit "$repo" "Target Branch: \`$target_branch\`"
+
     local current_branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
     local original_branch="$current_branch"
     local migration_status=""
@@ -152,6 +161,7 @@ process_sync() {
     # Leave dirty repos untouched — developer must resolve manually
     if [ -n "$(git -C "$repo" status --short)" ]; then
         update_status "$repo" "${YELLOW}[DIRTY   ]${NC} $current_branch"
+        update_audit "$repo" "Status: [DIRTY] - Local changes found. Skipping sync."
         return 0
     fi
 
@@ -166,6 +176,7 @@ process_sync() {
             if git -C "$repo" checkout "$target_branch" >> "$log_file" 2>&1; then
                 current_branch="$target_branch"
                 migration_status="$original_branch ➔ "
+                update_audit "$repo" "Action: Checked out target branch \`$target_branch\` (was \`$original_branch\`)."
             else
                 update_status "$repo" "${RED}[SKIP-DIR]${NC} $current_branch (dirty?)"
                 return 1
@@ -195,26 +206,32 @@ process_sync() {
     UPSTREAM=$(git -C "$repo" rev-parse --abbrev-ref "$target_branch"@{u} 2>/dev/null || echo "origin/$target_branch")
     REMOTE=$(git -C "$repo" rev-parse "$UPSTREAM" 2>/dev/null)
 
-    if [ "$LOCAL" == "$REMOTE" ] && [ "$FORCE_SYNC" == "false" ]; then
+    if [ "$LOCAL" == "$REMOTE" ]; then
+        # Already in sync — show SYNCED regardless of force mode.
+        # With -f we do NOT return early; we fall through to the install block below.
         update_status "$repo" "${GREEN}[SYNCED  ]${NC} $migration_status$current_branch"
-        return 0
+        update_audit "$repo" "Git: [SYNCED] - Already at commit \`${LOCAL:0:7}\`."
+        [ "$FORCE_SYNC" == "false" ] && return 0
     fi
 
     # Only fast-forward — never rebase or reset automatically
     if [ "$DRY_RUN" == "true" ]; then
         update_status "$repo" "${BLUE}[UPDATING]${NC} (DRY RUN) Merging..."
         sleep 0.5
-    elif git -C "$repo" merge-base --is-ancestor "$REMOTE" "$LOCAL" 2>/dev/null; then
+    elif [ "$LOCAL" != "$REMOTE" ] && git -C "$repo" merge-base --is-ancestor "$REMOTE" "$LOCAL" 2>/dev/null; then
         update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch (ahead)"
     elif git -C "$repo" merge-base --is-ancestor "$LOCAL" "$REMOTE" 2>/dev/null; then
         update_status "$repo" "${BLUE}[UPDATING]${NC} Fast-forwarding..."
         git -C "$repo" merge --quiet --ff-only "$UPSTREAM" >> "$log_file" 2>&1
+        update_audit "$repo" "Git: [SUCCESS] - Fast-forwarded to \`$UPSTREAM\` (\`${REMOTE:0:7}\`)."
     else
         update_status "$repo" "${RED}[OUT SYNC]${NC} $migration_status$current_branch (rebase req)"
+        update_audit "$repo" "Git: [OUT SYNC] - Diversion found. Manual rebase required."
         return 1
     fi
 
     # Dependency install is opt-in (-i or -f) — never runs silently by default
+
     if [ "$AUTO_INSTALL" == "false" ] && [ "$FORCE_SYNC" == "false" ]; then
         update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch"
         return 0
@@ -222,13 +239,24 @@ process_sync() {
 
     if ! git -C "$repo" diff --quiet HEAD@{1} HEAD \
          -- yarn.lock package-lock.json pnpm-lock.yaml bun.lockb package.json \
+         2>>"$log_file" \
          || [ "$FORCE_SYNC" == "true" ]; then
 
         if [ "$DRY_RUN" == "true" ]; then
+
             update_status "$repo" "${PURPLE}[DEPS    ]${NC} (DRY RUN) Installing..."
             sleep 0.5
             update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch (dry run)"
         else
+            # Honour .nvmrc / .node-version before touching any lockfile.
+            # A version mismatch here is the most common cause of silent install failures.
+            ensure_node_version "$repo" "$log_file"
+            if [ -f "$repo/.nvmrc" ]; then
+                update_audit "$repo" "Node: Loaded version from \`.nvmrc\` (\`$(cat "$repo/.nvmrc")\`)."
+            elif [ -f "$repo/.node-version" ]; then
+                update_audit "$repo" "Node: Loaded version from \`.node-version\` (\`$(cat "$repo/.node-version")\`)."
+            fi
+
             # Pick the package manager by the most recently modified lockfile
             NEWEST_LOCK=$(ls -1t \
                 "$repo"/yarn.lock "$repo"/package-lock.json \
@@ -238,18 +266,26 @@ process_sync() {
                 update_status "$repo" "${PURPLE}[YARN    ]${NC} Installing..."
                 (cd "$repo" || return; yarn --silent --non-interactive) >> "$log_file" 2>&1
                 update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + yarn"
+                update_audit "$repo" "Deps: [SUCCESS] - Updated dependencies with **Yarn**."
             elif [[ "$NEWEST_LOCK" == *"pnpm-lock.yaml" ]]; then
                 update_status "$repo" "${PURPLE}[PNPM    ]${NC} Installing..."
                 (cd "$repo" || return; pnpm install --silent) >> "$log_file" 2>&1
                 update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + pnpm"
+                update_audit "$repo" "Deps: [SUCCESS] - Updated dependencies with **pnpm**."
             elif [[ "$NEWEST_LOCK" == *"bun.lockb" ]]; then
                 update_status "$repo" "${PURPLE}[BUN     ]${NC} Installing..."
                 (cd "$repo" || return; bun install --silent) >> "$log_file" 2>&1
                 update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + bun"
+                update_audit "$repo" "Deps: [SUCCESS] - Updated dependencies with **Bun**."
             elif [[ "$NEWEST_LOCK" == *"package-lock.json" ]] || [ -f "$repo/package.json" ]; then
                 update_status "$repo" "${PURPLE}[NPM     ]${NC} Installing..."
                 (cd "$repo" || return; npm install --silent) >> "$log_file" 2>&1
                 update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + npm"
+                update_audit "$repo" "Deps: [SUCCESS] - Updated dependencies with **NPM**."
+            else
+                # No supported package manager found — mark as success to clear the [UPDATING] status
+                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch"
+                update_audit "$repo" "Deps: [SKIP] - No supported package manager found."
             fi
         fi
     else
@@ -273,6 +309,7 @@ while [[ "$#" -gt 0 ]]; do
         -m|--main)     MIGRATE_TO_MAIN=true ;;
         -f|--force)    FORCE_SYNC=true ;;
         -d|--dry-run)  DRY_RUN=true ;;
+        -a|--audit)    AUDIT_ENABLED=true ;;
         -e|--exclude)  EXCLUDED_REPOS+=("$2"); shift ;;
         -y|--yes)      NON_INTERACTIVE=true ;;
         *) echo -e "${RED}Unknown parameter: $1${NC}"; show_help; exit 1 ;;
@@ -361,9 +398,35 @@ cleanup() {
     fi
     echo "$(date +%s) $final_status" > "$MEMORY_FILE"
 
-    rm -rf "$STATUS_DIR" "$LOG_DIR"
+    # Synthesis of the Mission Audit Log
+    if [ "$AUDIT_ENABLED" == "true" ]; then
+        {
+            echo "# 🚀 STRIVE-SYNC AUDIT"
+            echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "## 📊 Mission Summary"
+            echo "- **Status**: $final_status"
+            echo "- **Duration**: ${ELAPSED}s"
+            echo "- **User**: $USER"
+            echo "- **Workspace**: $(pwd)"
+            echo ""
+            echo "## 🛡️ Repository Details"
+            echo ""
+            # Sort and append all worker snippets
+            for snippet in $(ls "$AUDIT_DIR"/*.md 2>/dev/null | sort); do
+                cat "$snippet"
+                echo ""
+                echo "---"
+                echo ""
+            done
+            echo "Generated by Striving Designs · strivingdesigns.com"
+        } > "$AUDIT_FILE"
+    fi
+
+    rm -rf "$STATUS_DIR" "$LOG_DIR" "$AUDIT_DIR"
     echo -e "\n${BLUE}────────────────────────────────────────────────────────────${NC}"
     echo -e "${CYAN}${BOLD}MISSION COMPLETE in ${ELAPSED}s${NC}"
+    [ "$AUDIT_ENABLED" == "true" ] && echo -e "${YELLOW}Audit report saved to: ${BOLD}$AUDIT_FILE${NC}"
 }
 trap cleanup EXIT INT TERM
 

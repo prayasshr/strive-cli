@@ -48,6 +48,65 @@ get_relative_time() {
     fi
 }
 
+# Ensures the repo's required Node.js version is active before installing packages.
+# Must be called from within the repo directory (or with -C / cd).
+# Returns 0 on success or skip (no version file), 1 if nvm can't be loaded.
+#
+# Supports:  .nvmrc   .node-version
+# Manager:   nvm (sourced from ~/.nvm/nvm.sh if not already a function)
+ensure_node_version() {
+    local repo="$1"
+    local log_file="$2"
+
+    # Check for a version pin file (prefer .nvmrc, fall back to .node-version)
+    local version_file=""
+    if [ -f "$repo/.nvmrc" ]; then
+        version_file="$repo/.nvmrc"
+    elif [ -f "$repo/.node-version" ]; then
+        version_file="$repo/.node-version"
+    else
+        return 0  # No version file — nothing to do
+    fi
+
+    # Make sure nvm is available as a shell function in this subshell.
+    # Background workers don't inherit interactive-shell functions, so we
+    # explicitly source nvm.sh from its standard locations.
+    if ! declare -f nvm > /dev/null 2>&1; then
+        local nvm_script="${NVM_DIR:-$HOME/.nvm}/nvm.sh"
+        if [ -s "$nvm_script" ]; then
+            # shellcheck source=/dev/null
+            . "$nvm_script" --no-use >> "$log_file" 2>&1
+        else
+            echo "[nvm] WARNING: nvm not found ($nvm_script missing). Skipping version switch." >> "$log_file"
+            return 1
+        fi
+    fi
+
+    echo "[nvm] Found $(basename "$version_file") in $repo. Switching Node version..." >> "$log_file"
+    # Run in a sub-shell so the cd doesn't affect the worker's working directory.
+    ( cd "$repo" && nvm use --silent >> "$log_file" 2>&1 )
+    local exit_code=$?
+
+    if [ $exit_code -ne 0 ]; then
+        echo "[nvm] WARNING: 'nvm use' failed (exit $exit_code). Continuing with current Node." >> "$log_file"
+    fi
+    return $exit_code
+}
+
+# Appends an entry to the repo's audit log snippet.
+# Internal Use: Only called if AUDIT_ENABLED is true.
+update_audit() {
+    local repo="$1"
+    local message="$2"
+    [ "$AUDIT_ENABLED" != "true" ] && return 0
+    
+    local snippet_id=$(echo "$repo" | sed 's|/|__|g')
+    [ "$repo" == "." ] && snippet_id="__root__"
+    
+    local audit_file="$AUDIT_DIR/${snippet_id}.md"
+    echo "- $message" >> "$audit_file"
+}
+
 # Writes a repo's current status string to its file in $STATUS_DIR.
 # Called by workers — never write to stdout from a worker directly, as it
 # will corrupt the dashboard's cursor position arithmetic.

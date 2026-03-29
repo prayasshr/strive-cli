@@ -1,4 +1,4 @@
-# 🚀 Strive-Sync (v1.2.0)
+# 🚀 Strive-Sync (v1.3.0)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Version](https://img.shields.io/github/v/tag/prayasshr/strive-cli?label=version&color=brightgreen)](https://github.com/prayasshr/strive-cli/releases)
@@ -23,7 +23,9 @@ If you work in a microservices architecture or a distributed workspace, `strive-
 - 🏎️ **Parallel Execution**: Syncs all repositories concurrently.
 - 🎛️ **Mission Control Dashboard**: Real-time visual tracking for sync status, dirty states, and updates.
 - 🧠 **Smart Branch Detection**: Automatically detects each repo's default branch from its remote HEAD reference — no hardcoding of `main` or `master`.
-- 📦 **Install Packages**: Use `--install` (`-i`) to update dependencies only when lockfiles change.
+- 📦 **Install Packages**: Use `--install` (`-i`) to update dependencies only when lockfiles change. Automatically honours `.nvmrc` and `.node-version` — `nvm use` is called before any install so the correct Node.js version is always active.
+- 🛡️ **Mission Audit Trail**: Use `--audit` (`-a`) to generate a persistent `AUDIT.md` report of your sync mission, including specific decisions made for each repository (branch detected, node version used, etc).
+
 - 🎯 **Pinpoint Controls**:
   - `--only <repo>`: Sync ONLY the specified repository.
   - `--branch <name>` (`-b`): Override the target branch for all repos.
@@ -66,6 +68,7 @@ strive-sync --force
 | `--install` | `-i` | Install Packages only if lockfiles change. |
 | `--main` | `-m` | Switch to Main branch (if clean) before syncing. |
 | `--force` | `-f` | Force Everything: pull and reinstall even if up-to-date. |
+| `--audit` | `-a` | Generate AUDIT.md report of the mission. |
 | `--parallel <num>` | `-p` | Max parallel processes (default: 4). |
 | `--yes` | `-y` | Non-interactive mode: bypass interactive briefing. |
 | `--version` | `-v` | Print version and exit. |
