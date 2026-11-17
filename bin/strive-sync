@@ -129,6 +129,8 @@ detect_default_branch() {
 # Writes status updates to $STATUS_DIR; never touches stdout directly.
 process_sync() {
     local repo_info=$1
+    # Other .repos entries inside this same git repo, one per line (SYNC-03)
+    local aliases=$2
     local repo=$(echo "$repo_info" | cut -d: -f1)
     local branch_in_file=$(echo "$repo_info" | cut -d: -f2)
     local log_file="$LOG_DIR/$(echo "$repo" | sed 's|/|__|g').log"
@@ -222,7 +224,11 @@ process_sync() {
         update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch (ahead)"
     elif git -C "$repo" merge-base --is-ancestor "$LOCAL" "$REMOTE" 2>/dev/null; then
         update_status "$repo" "${BLUE}[UPDATING]${NC} Fast-forwarding..."
-        git -C "$repo" merge --quiet --ff-only "$UPSTREAM" >> "$log_file" 2>&1
+        if ! git -C "$repo" merge --quiet --ff-only "$UPSTREAM" >> "$log_file" 2>&1; then
+            update_status "$repo" "${RED}[FAILED  ]${NC} Merge failed · log: $(keep_log "$repo" "$log_file")"
+            update_audit "$repo" "Git: [FAILED] - Fast-forward to \`$UPSTREAM\` failed."
+            return 1
+        fi
         update_audit "$repo" "Git: [SUCCESS] - Fast-forwarded to \`$UPSTREAM\` (\`${REMOTE:0:7}\`)."
     else
         update_status "$repo" "${RED}[OUT SYNC]${NC} $migration_status$current_branch (rebase req)"
@@ -237,60 +243,181 @@ process_sync() {
         return 0
     fi
 
-    if ! git -C "$repo" diff --quiet HEAD@{1} HEAD \
-         -- yarn.lock package-lock.json pnpm-lock.yaml bun.lockb package.json \
-         2>>"$log_file" \
-         || [ "$FORCE_SYNC" == "true" ]; then
+    # The repo folder and every .repos entry inside it are separate packages:
+    # each gets its own lockfile check and install, in its own folder.
+    local packages=("$repo") alias_path
+    while IFS= read -r alias_path; do
+        [ -n "$alias_path" ] && packages+=("$alias_path")
+    done <<< "$aliases"
 
-        if [ "$DRY_RUN" == "true" ]; then
+    # A dry run never merges, so predict from the fetched remote commit
+    local after=HEAD
+    [ "$DRY_RUN" == "true" ] && after=${REMOTE:-HEAD}
 
-            update_status "$repo" "${PURPLE}[DEPS    ]${NC} (DRY RUN) Installing..."
-            sleep 0.5
-            update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch (dry run)"
-        else
-            # Honour .nvmrc / .node-version before touching any lockfile.
-            # A version mismatch here is the most common cause of silent install failures.
-            ensure_node_version "$repo" "$log_file"
-            if [ -f "$repo/.nvmrc" ]; then
-                update_audit "$repo" "Node: Loaded version from \`.nvmrc\` (\`$(cat "$repo/.nvmrc")\`)."
-            elif [ -f "$repo/.node-version" ]; then
-                update_audit "$repo" "Node: Loaded version from \`.node-version\` (\`$(cat "$repo/.node-version")\`)."
-            fi
-
-            # Pick the package manager by the most recently modified lockfile
-            NEWEST_LOCK=$(ls -1t \
-                "$repo"/yarn.lock "$repo"/package-lock.json \
-                "$repo"/pnpm-lock.yaml "$repo"/bun.lockb 2>/dev/null | head -n 1)
-
-            if [[ "$NEWEST_LOCK" == *"yarn.lock" ]]; then
-                update_status "$repo" "${PURPLE}[YARN    ]${NC} Installing..."
-                (cd "$repo" || return; yarn --silent --non-interactive) >> "$log_file" 2>&1
-                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + yarn"
-                update_audit "$repo" "Deps: [SUCCESS] - Updated dependencies with **Yarn**."
-            elif [[ "$NEWEST_LOCK" == *"pnpm-lock.yaml" ]]; then
-                update_status "$repo" "${PURPLE}[PNPM    ]${NC} Installing..."
-                (cd "$repo" || return; pnpm install --silent) >> "$log_file" 2>&1
-                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + pnpm"
-                update_audit "$repo" "Deps: [SUCCESS] - Updated dependencies with **pnpm**."
-            elif [[ "$NEWEST_LOCK" == *"bun.lockb" ]]; then
-                update_status "$repo" "${PURPLE}[BUN     ]${NC} Installing..."
-                (cd "$repo" || return; bun install --silent) >> "$log_file" 2>&1
-                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + bun"
-                update_audit "$repo" "Deps: [SUCCESS] - Updated dependencies with **Bun**."
-            elif [[ "$NEWEST_LOCK" == *"package-lock.json" ]] || [ -f "$repo/package.json" ]; then
-                update_status "$repo" "${PURPLE}[NPM     ]${NC} Installing..."
-                (cd "$repo" || return; npm install --silent) >> "$log_file" 2>&1
-                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch + npm"
-                update_audit "$repo" "Deps: [SUCCESS] - Updated dependencies with **NPM**."
+    local pkg result summary="" repo_failed=false
+    for pkg in "${packages[@]}"; do
+        if result=$(install_package "$pkg" "$LOCAL" "$after"); then
+            if [ "$pkg" == "$repo" ]; then
+                summary="$result"
             else
-                # No supported package manager found — mark as success to clear the [UPDATING] status
-                update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch"
-                update_audit "$repo" "Deps: [SKIP] - No supported package manager found."
+                update_status "$pkg" "${GREEN}[SUCCESS ]${NC} part of $repo${result:+ + $result}"
+            fi
+        else
+            update_status "$pkg" "${RED}[FAILED  ]${NC} $result"
+            [ "$pkg" == "$repo" ] && repo_failed=true
+        fi
+    done
+
+    # Installs must never leave the repo dirty, or every later run skips it.
+    # Report it and leave the files alone (sync never resets anything).
+    if [ "$DRY_RUN" == "false" ]; then
+        local changed
+        changed=$(git -C "$repo" status --porcelain 2>/dev/null | awk '{print $2}' | head -n 3 | tr '\n' ' ')
+        if [ -n "$changed" ]; then
+            update_status "$repo" "${RED}[FAILED  ]${NC} Install changed files: ${changed}(left as is)"
+            update_audit "$repo" "Deps: [FAILED] - Install changed tracked files: $changed"
+            return 1
+        fi
+    fi
+
+    [ "$repo_failed" == "true" ] && return 1
+    update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch${summary:+ + $summary}"
+}
+
+LOCK_FILES="package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb"
+LOCKFILE_MISMATCH='are in sync|lockfile needs to be updated|YN0028|ERR_PNPM_OUTDATED_LOCKFILE|lockfile is frozen'
+
+# Copies a log to the state folder so it survives cleanup, and prints its path.
+keep_log() {
+    local id=$1 log_file=$2 kept
+    mkdir -p "$MEMORY_DIR/logs"
+    kept="$MEMORY_DIR/logs/$(echo "$id" | sed 's|/|__|g').log"
+    cp "$log_file" "$kept" 2>/dev/null
+    echo "$kept"
+}
+
+# Frozen-lockfile install command for a folder (SPEC 6.2). packageManager
+# wins over lockfiles. None of these commands ever write the lockfile.
+pick_install_command() {
+    local dir=$1 pm name major
+    pm=$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"\([a-z]*\)@\([0-9]*\).*/\1 \2/p' "$dir/package.json" | head -n 1)
+    name=${pm%% *}
+    major=${pm##* }
+    if [ -z "$name" ]; then
+        if [ -f "$dir/pnpm-lock.yaml" ]; then
+            name=pnpm
+        elif [ -f "$dir/yarn.lock" ]; then
+            name=yarn
+            major=1
+            [ -f "$dir/.yarnrc.yml" ] && major=2
+        elif [ -f "$dir/bun.lock" ] || [ -f "$dir/bun.lockb" ]; then
+            name=bun
+        else
+            name=npm
+        fi
+    fi
+    case "$name" in
+        pnpm) echo "pnpm install --frozen-lockfile" ;;
+        bun)  echo "bun install --frozen-lockfile" ;;
+        yarn)
+            if [ "${major:-1}" -ge 2 ] 2>/dev/null; then
+                echo "yarn install --immutable"
+            else
+                echo "yarn install --frozen-lockfile --non-interactive"
+            fi ;;
+        *)
+            if [ -f "$dir/package-lock.json" ] || [ -f "$dir/npm-shrinkwrap.json" ]; then
+                echo "npm ci"
+            else
+                echo "npm install --no-package-lock"
+            fi ;;
+    esac
+}
+
+# Node version a folder asks for: the nearest .nvmrc or .node-version,
+# looking from the folder up to its repo root.
+node_version_for() {
+    local d top f
+    d=$(cd "$1" && pwd -P) || return 0
+    top=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)
+    while [ -n "$d" ]; do
+        for f in .nvmrc .node-version; do
+            if [ -f "$d/$f" ]; then
+                tr -d ' \r\n' < "$d/$f"
+                return 0
+            fi
+        done
+        if [ -z "$top" ] || [ "$d" == "$top" ] || [ "$d" == "/" ]; then
+            return 0
+        fi
+        d=$(dirname "$d")
+    done
+}
+
+# Runs a command in a folder under its Node version. nvm is loaded in the
+# same subshell as the command, so the switch applies to it.
+# Exit 97: the wanted Node version is not installed.
+run_with_node() {
+    local dir=$1 log_file=$2 cmd=$3 version
+    version=$(node_version_for "$dir")
+    (
+        cd "$dir" || exit 1
+        if [ -n "$version" ]; then
+            nvm_script="${NVM_DIR:-$HOME/.nvm}/nvm.sh"
+            if [ -s "$nvm_script" ]; then
+                # shellcheck source=/dev/null
+                . "$nvm_script" --no-use >> "$log_file" 2>&1
+                nvm use --silent "$version" >> "$log_file" 2>&1 || exit 97
+            else
+                echo "[node] nvm not found, using the current Node for $version" >> "$log_file"
             fi
         fi
-    else
-        update_status "$repo" "${GREEN}[SUCCESS ]${NC} $migration_status$current_branch"
+        echo "[install] node $(node -v 2>/dev/null) · $cmd" >> "$log_file"
+        # $cmd is one of the fixed commands from pick_install_command
+        $cmd >> "$log_file" 2>&1
+    )
+}
+
+# Installs one package folder when its manifest or lockfile changed between
+# `before` and `after` (or always with -f). Prints a short result for the status
+# line. Returns 1 on failure, with the reason and the kept log path printed.
+install_package() {
+    local dir=$1 before=$2 after=$3 cmd version log_file rc
+    [ -f "$dir/package.json" ] || return 0
+    # Pathspecs are relative to $dir, so a subfolder only sees its own lockfile.
+    # Exit 1 means changed; any other code (e.g. a commit that doesn't exist) means don't install.
+    if [ "$FORCE_SYNC" != "true" ]; then
+        # shellcheck disable=SC2086  # LOCK_FILES is a list of pathspecs
+        git -C "$dir" diff --quiet "$before" "$after" -- $LOCK_FILES 2>/dev/null
+        [ $? -eq 1 ] || return 0
     fi
+
+    cmd=$(pick_install_command "$dir")
+    if [ "$DRY_RUN" == "true" ]; then
+        echo "would run $cmd"
+        return 0
+    fi
+
+    log_file="$LOG_DIR/$(echo "$dir" | sed 's|/|__|g').install.log"
+    update_status "$dir" "${PURPLE}[DEPS    ]${NC} $cmd..."
+    run_with_node "$dir" "$log_file" "$cmd"
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        update_audit "$dir" "Deps: [SUCCESS] - \`$cmd\`."
+        echo "$cmd"
+        return 0
+    fi
+
+    if [ $rc -eq 97 ]; then
+        version=$(node_version_for "$dir")
+        echo "Needs Node $version · fix: nvm install $version"
+    elif grep -qE "$LOCKFILE_MISMATCH" "$log_file" 2>/dev/null; then
+        echo "Lockfile out of sync with package.json, fix it in the repo · log: $(keep_log "$dir" "$log_file")"
+    else
+        echo "$cmd failed · log: $(keep_log "$dir" "$log_file")"
+    fi
+    update_audit "$dir" "Deps: [FAILED] - \`$cmd\` (exit $rc)."
+    return 1
 }
 
 # ============================================================================
@@ -430,9 +557,45 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Entries that share one git root are one repo (SYNC-03): the first entry runs
+# git, the others only get their own install step. Running git twice in
+# parallel on one repo makes one of them fail on git's lock.
+TOPS=(); ALIASES=(); IS_ALIAS=()
+for i in "${!REPOS[@]}"; do
+    path=${REPOS[$i]%%:*}
+    TOPS[$i]=$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)
+    ALIASES[$i]=""
+    IS_ALIAS[$i]=false
+    [ -z "${TOPS[$i]}" ] && continue
+    for (( j=0; j<i; j++ )); do
+        if [ "${IS_ALIAS[$j]}" == "false" ] && [ "${TOPS[$j]}" == "${TOPS[$i]}" ]; then
+            IS_ALIAS[$i]=true
+            ALIASES[$j]="${ALIASES[$j]}$path"$'\n'
+            break
+        fi
+    done
+done
+
+# Runs one repo, then gives each alias row the repo's status if the install
+# step didn't already set one (e.g. the repo was dirty or already synced).
+sync_group() {
+    local repo=${1%%:*} aliases=$2 alias_path line rc
+    process_sync "$1" "$aliases"
+    rc=$?
+    line=$(cat "$STATUS_DIR/$(echo "$repo" | sed 's|/|__|g')" 2>/dev/null)
+    while IFS= read -r alias_path; do
+        [ -z "$alias_path" ] && continue
+        if grep -q '\[WAITING \]' "$STATUS_DIR/$(echo "$alias_path" | sed 's|/|__|g')" 2>/dev/null; then
+            update_status "$alias_path" "${line%%]*}]${NC} part of $repo"
+        fi
+    done <<< "$aliases"
+    return $rc
+}
+
 WORKER_PIDS=()
-for repo_info in "${REPOS[@]}"; do
-    process_sync "$repo_info" &
+for i in "${!REPOS[@]}"; do
+    [ "${IS_ALIAS[$i]}" == "true" ] && continue
+    sync_group "${REPOS[$i]}" "${ALIASES[$i]}" &
     WORKER_PIDS+=($!)
     while [ $(jobs -r | wc -l) -ge $((MAX_PARALLEL + 1)) ]; do
         sleep 0.1
