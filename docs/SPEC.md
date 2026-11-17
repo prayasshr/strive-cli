@@ -275,6 +275,7 @@ Then remove `--exclude` entries and `skip: true` repos (reported as `skipped`).
 
 **Grouping.** For each entry resolve `git rev-parse --show-toplevel` and `--git-common-dir`:
 - Entries with the same top level are one repo. It is shown once, named after the first entry, with the others listed as aliases.
+- Git steps run once per repo. Dependencies are per folder: the repo's folder and each alias folder are checked and installed on their own (section 6), each with its own lockfile and the nearest runtime version file up to the repo root. A subfolder with its own manifest (e.g. `web-app/ui`) only gets installs because it is listed.
 - Repos with the same common dir (linked worktrees) are separate repos but run one after another, never in parallel.
 
 ### 5.3 Per-repo steps
